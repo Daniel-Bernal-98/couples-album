@@ -3,7 +3,7 @@ import { db, storage, fs, st } from "./firebase.js";
 import { el, clear } from "./ui.js";
 import {
   sha256Hex, toB64, aesGcmEncrypt, deriveKeyFromPassphrase,
-  jsonToBytes, toHex
+  jsonToBytes, fromB64
 } from "./crypto.js";
 import { fileToImageBitmap, resizeToJpegBytes } from "./images.js";
 import { detectPrintedDateText, parsePrintedDateToISO } from "./ocr.js";
@@ -35,6 +35,10 @@ async function getOrInitAlbumDoc(adminTokenHash) {
   return albumDoc;
 }
 
+function isValidISODate(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
 export async function renderAdmin(root) {
   clear(root);
 
@@ -50,96 +54,206 @@ export async function renderAdmin(root) {
   const adminTokenHash = await sha256Hex(token);
 
   card.append(el("h2", { text: "Admin uploader" }));
-  card.append(el("div", { class: "help", text: "This page is for uploading only. Keep your admin token private." }));
+  card.append(el("div", { class: "help", text: "Keep your admin token private." }));
 
   const pass = el("input", { class: "input", type: "password", placeholder: "Passphrase (same as viewer)" });
   const initBtn = el("button", { class: "btn", text: "Initialize / Unlock" });
   const status = el("div", { class: "help", text: "" });
 
-  const file = el("input", { type: "file", accept: "image/*", multiple: true, class: "input" });
+  const file = el("input", { type: "file", accept: "image/jpeg", multiple: true, class: "input" });
   file.disabled = true;
+
+  const queueWrap = el("div", { class: "card" });
+  const queueTitle = el("div", { class: "row" }, [
+    el("div", { text: "Upload queue" }),
+    el("div", { class: "spacer" }),
+    el("button", { class: "btn secondary", text: "Clear queue", onclick: () => clearQueue() })
+  ]);
+  const queueList = el("div", { style: "display:grid; gap:12px; margin-top:10px;" });
+
+  queueWrap.append(queueTitle);
+  queueWrap.append(el("div", { class: "help", text: "Tip: OCR date is best-effort—edit it if needed before uploading." }));
+  queueWrap.append(queueList);
 
   card.append(el("div", { class: "row" }, [pass, initBtn]));
   card.append(status);
-  card.append(el("div", { class: "help", text: "Select photos to upload:" }));
+  card.append(el("div", { class: "help", text: "Select JPEG photos to upload:" }));
   card.append(file);
+  root.append(queueWrap);
 
   let album = null;
   let key = null;
+  let uploading = false;
+  const queue = []; // { id, file, dateISO, description, ocrRaw, rowEls... }
+
+  function setUploading(v) {
+    uploading = v;
+    file.disabled = v || !key;
+    initBtn.disabled = v;
+  }
+
+  function clearQueue() {
+    if (uploading) return;
+    queue.length = 0;
+    queueList.innerHTML = "";
+    status.textContent = "";
+  }
 
   initBtn.onclick = async () => {
     status.textContent = "Initializing…";
-    album = await getOrInitAlbumDoc(adminTokenHash);
+    setUploading(true);
 
-    // Derive encryption key
-    const saltBytes = (await import("./crypto.js")).fromB64(album.kdf.saltB64);
-    key = await deriveKeyFromPassphrase(pass.value, saltBytes, album.kdf.iterations);
+    try {
+      album = await getOrInitAlbumDoc(adminTokenHash);
 
-    status.textContent = "Ready. Choose files to upload.";
-    file.disabled = false;
+      // Derive encryption key
+      const saltBytes = fromB64(album.kdf.saltB64);
+      key = await deriveKeyFromPassphrase(pass.value, saltBytes, album.kdf.iterations);
+
+      status.textContent = "Ready. Choose files to upload.";
+      setUploading(false);
+    } catch (e) {
+      console.error(e);
+      status.textContent = "Failed to initialize/unlock. Check passphrase and try again.";
+      key = null;
+      setUploading(false);
+    }
   };
 
   file.onchange = async () => {
     if (!file.files?.length) return;
+    if (!key) {
+      status.textContent = "Unlock first.";
+      file.value = "";
+      return;
+    }
 
+    status.textContent = `Preparing ${file.files.length} file(s)…`;
+
+    // Build queue items (OCR can take time; do it sequentially to avoid freezing)
     for (const f of file.files) {
-      status.textContent = `Processing: ${f.name}…`;
+      const item = {
+        id: crypto.randomUUID(),
+        file: f,
+        dateISO: "",
+        description: "",
+        ocrRaw: "",
+      };
 
       // OCR date (best effort)
-      let ocrRaw = "";
-      let dateISO = "";
       try {
         const r = await detectPrintedDateText(f);
-        ocrRaw = r.text || "";
-        dateISO = parsePrintedDateToISO(ocrRaw);
+        item.ocrRaw = r.text || "";
+        item.dateISO = parsePrintedDateToISO(item.ocrRaw) || "";
       } catch {
         // ignore OCR errors
       }
 
-      const bmp = await fileToImageBitmap(f);
-
-      // Thumbs for smooth iPhone scrolling
-      const thumb = await resizeToJpegBytes(bmp, 480, 0.75);
-
-      // Full: keep original-ish (your images are ~1.7MP; still cap to 1600px for safety)
-      const full = await resizeToJpegBytes(bmp, 1600, 0.85);
-
-      // Encrypt blobs
-      const thumbEnc = await aesGcmEncrypt(key, thumb.bytes);
-      const fullEnc = await aesGcmEncrypt(key, full.bytes);
-
-      const meta = {
-        description: "",
-        ocrRawText: ocrRaw,
-        originalFilename: f.name
-      };
-      const metaEnc = await aesGcmEncrypt(key, jsonToBytes(meta));
-
-      // Upload encrypted bytes to Storage
-      const photoId = crypto.randomUUID();
-      const basePath = `albums/${APP.albumId}/${photoId}`;
-
-      const thumbPath = `${basePath}/thumb.bin`;
-      const fullPath = `${basePath}/full.bin`;
-
-      await st.uploadBytes(st.ref(storage, thumbPath), new Blob([thumbEnc.cipherBytes]));
-      await st.uploadBytes(st.ref(storage, fullPath), new Blob([fullEnc.cipherBytes]));
-
-      // Write Firestore doc (includes adminTokenHash for rules)
-      await fs.addDoc(fs.collection(db, "albums", APP.albumId, "photos"), {
-        adminTokenHash,
-        createdAt: fs.serverTimestamp(),
-        dateISO,
-        w: full.w, h: full.h,
-        metaEnc: { ivB64: toB64(metaEnc.ivBytes), cipherB64: toB64(metaEnc.cipherBytes) },
-        thumb: { path: thumbPath, ivB64: toB64(thumbEnc.ivBytes) },
-        full: { path: fullPath, ivB64: toB64(fullEnc.ivBytes) }
-      });
-
-      status.textContent = `Uploaded: ${f.name}`;
+      queue.push(item);
+      queueList.append(renderQueueRow(item));
     }
 
-    status.textContent = "Done uploading.";
+    status.textContent = "Queue ready. Fill description/date and click Upload.";
     file.value = "";
   };
+
+  function renderQueueRow(item) {
+    const name = el("div", { text: item.file.name });
+    const small = el("div", { class: "help", text: item.ocrRaw ? `OCR: ${item.ocrRaw}` : "OCR: —" });
+
+    const dateInput = el("input", {
+      class: "input",
+      placeholder: "YYYY-MM-DD",
+      value: item.dateISO || ""
+    });
+    dateInput.addEventListener("input", () => { item.dateISO = dateInput.value.trim(); });
+
+    const descInput = el("input", {
+      class: "input",
+      placeholder: "Description (optional)",
+      value: item.description || ""
+    });
+    descInput.addEventListener("input", () => { item.description = descInput.value; });
+
+    const uploadBtn = el("button", { class: "btn", text: "Upload" });
+    const lineStatus = el("div", { class: "help", text: "" });
+
+    uploadBtn.onclick = async () => {
+      if (uploading) return;
+      if (!key) return;
+
+      const dateISO = (item.dateISO || "").trim();
+      if (dateISO && !isValidISODate(dateISO)) {
+        lineStatus.textContent = "Date must be YYYY-MM-DD (or leave blank).";
+        return;
+      }
+
+      setUploading(true);
+      uploadBtn.disabled = true;
+      lineStatus.textContent = "Uploading…";
+
+      try {
+        // Prepare images
+        const bmp = await fileToImageBitmap(item.file);
+
+        // Thumbs for smooth iPhone scrolling
+        const thumb = await resizeToJpegBytes(bmp, 480, 0.75);
+
+        // Full: your images are small; still cap for safety
+        const full = await resizeToJpegBytes(bmp, 1600, 0.85);
+
+        // Encrypt blobs
+        const thumbEnc = await aesGcmEncrypt(key, thumb.bytes);
+        const fullEnc = await aesGcmEncrypt(key, full.bytes);
+
+        // Encrypt metadata (includes description + ocr)
+        const meta = {
+          description: item.description || "",
+          ocrRawText: item.ocrRaw || "",
+          originalFilename: item.file.name
+        };
+        const metaEnc = await aesGcmEncrypt(key, jsonToBytes(meta));
+
+        // Upload encrypted bytes to Storage
+        const photoId = crypto.randomUUID();
+        const basePath = `albums/${APP.albumId}/${photoId}`;
+        const thumbPath = `${basePath}/thumb.bin`;
+        const fullPath = `${basePath}/full.bin`;
+
+        await st.uploadBytes(st.ref(storage, thumbPath), new Blob([thumbEnc.cipherBytes]));
+        await st.uploadBytes(st.ref(storage, fullPath), new Blob([fullEnc.cipherBytes]));
+
+        // Write Firestore doc (includes adminTokenHash for rules)
+        await fs.addDoc(fs.collection(db, "albums", APP.albumId, "photos"), {
+          adminTokenHash,
+          createdAt: fs.serverTimestamp(),
+          dateISO: dateISO || "",
+          w: full.w, h: full.h,
+          metaEnc: { ivB64: toB64(metaEnc.ivBytes), cipherB64: toB64(metaEnc.cipherBytes) },
+          thumb: { path: thumbPath, ivB64: toB64(thumbEnc.ivBytes) },
+          full: { path: fullPath, ivB64: toB64(fullEnc.ivBytes) }
+        });
+
+        lineStatus.textContent = "Uploaded.";
+      } catch (e) {
+        console.error(e);
+        lineStatus.textContent = "Upload failed. See console.";
+        uploadBtn.disabled = false;
+      } finally {
+        setUploading(false);
+      }
+    };
+
+    const row = el("div", { class: "card" }, [
+      el("div", { class: "row" }, [name, el("div", { class: "spacer" }), uploadBtn]),
+      small,
+      el("div", { class: "row" }, [
+        el("div", { style: "flex:1; min-width: 180px;" }, [dateInput]),
+        el("div", { style: "flex:3; min-width: 220px;" }, [descInput]),
+      ]),
+      lineStatus
+    ]);
+
+    return row;
+  }
 }

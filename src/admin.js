@@ -60,7 +60,7 @@ export async function renderAdmin(root) {
   const initBtn = el("button", { class: "btn", text: "Initialize / Unlock" });
   const status = el("div", { class: "help", text: "" });
 
-  const file = el("input", { type: "file", accept: "image/jpeg", multiple: true, class: "input" });
+  const file = el("input", { type: "file", accept: ".jpg,.jpeg,image/jpeg", multiple: true, class: "input" });
   file.disabled = true;
 
   const queueWrap = el("div", { class: "card" });

@@ -2,10 +2,10 @@ import { APP } from "./config.js";
 import { db, storage, fs, st } from "./firebase.js";
 import { el, clear } from "./ui.js";
 import {
-  sha256Hex, toB64, aesGcmEncrypt, deriveKeyFromPassphrase,
-  jsonToBytes, fromB64
+  sha256Hex, toB64, aesGcmEncrypt, aesGcmDecrypt, deriveKeyFromPassphrase,
+  jsonToBytes, bytesToJson, fromB64
 } from "./crypto.js";
-import { fileToImageBitmap, resizeToJpegBytes } from "./images.js";
+import { fileToImageBitmap, resizeToJpegBytes, bytesToObjectUrl } from "./images.js";
 import { detectPrintedDateText, parsePrintedDateToISO } from "./ocr.js";
 
 function getAdminTokenFromUrl() {
@@ -21,7 +21,6 @@ async function getOrInitAlbumDoc(adminTokenHash) {
 
   if (snap.exists()) return snap.data();
 
-  // Initialize album doc if it doesn't exist:
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const saltB64 = toB64(salt);
   const albumDoc = {
@@ -75,16 +74,30 @@ export async function renderAdmin(root) {
   queueWrap.append(el("div", { class: "help", text: "Tip: OCR date is best-effort—edit it if needed before uploading." }));
   queueWrap.append(queueList);
 
+  // NEW: manage section
+  const manageWrap = el("div", { class: "card" });
+  const manageHeader = el("div", { class: "row" }, [
+    el("div", { text: "Manage uploaded photos" }),
+    el("div", { class: "spacer" }),
+    el("button", { class: "btn secondary", text: "Refresh", onclick: () => refreshManage() })
+  ]);
+  const manageHelp = el("div", { class: "help", text: "Unlock first. You can edit descriptions/dates (encrypted descriptions) or delete items." });
+  const manageList = el("div", { style: "display:grid; gap:12px; margin-top:10px;" });
+  manageWrap.append(manageHeader, manageHelp, manageList);
+
   card.append(el("div", { class: "row" }, [pass, initBtn]));
   card.append(status);
   card.append(el("div", { class: "help", text: "Select JPEG photos to upload:" }));
   card.append(file);
   root.append(queueWrap);
+  root.append(manageWrap);
 
   let album = null;
   let key = null;
   let uploading = false;
-  const queue = []; // { id, file, dateISO, description, ocrRaw, rowEls... }
+  let unsubManage = null;
+
+  const queue = [];
 
   function setUploading(v) {
     uploading = v;
@@ -106,12 +119,14 @@ export async function renderAdmin(root) {
     try {
       album = await getOrInitAlbumDoc(adminTokenHash);
 
-      // Derive encryption key
       const saltBytes = fromB64(album.kdf.saltB64);
       key = await deriveKeyFromPassphrase(pass.value, saltBytes, album.kdf.iterations);
 
       status.textContent = "Ready. Choose files to upload.";
       setUploading(false);
+
+      // start / restart manage list
+      refreshManage(true);
     } catch (e) {
       console.error(e);
       status.textContent = "Failed to initialize/unlock. Check passphrase and try again.";
@@ -130,7 +145,6 @@ export async function renderAdmin(root) {
 
     status.textContent = `Preparing ${file.files.length} file(s)…`;
 
-    // Build queue items (OCR can take time; do it sequentially to avoid freezing)
     for (const f of file.files) {
       const item = {
         id: crypto.randomUUID(),
@@ -140,14 +154,11 @@ export async function renderAdmin(root) {
         ocrRaw: "",
       };
 
-      // OCR date (best effort)
       try {
         const r = await detectPrintedDateText(f);
         item.ocrRaw = r.text || "";
         item.dateISO = parsePrintedDateToISO(item.ocrRaw) || "";
-      } catch {
-        // ignore OCR errors
-      }
+      } catch {}
 
       queue.push(item);
       queueList.append(renderQueueRow(item));
@@ -193,20 +204,14 @@ export async function renderAdmin(root) {
       lineStatus.textContent = "Uploading…";
 
       try {
-        // Prepare images
         const bmp = await fileToImageBitmap(item.file);
 
-        // Thumbs for smooth iPhone scrolling
         const thumb = await resizeToJpegBytes(bmp, 480, 0.75);
-
-        // Full: your images are small; still cap for safety
         const full = await resizeToJpegBytes(bmp, 1600, 0.85);
 
-        // Encrypt blobs
         const thumbEnc = await aesGcmEncrypt(key, thumb.bytes);
         const fullEnc = await aesGcmEncrypt(key, full.bytes);
 
-        // Encrypt metadata (includes description + ocr)
         const meta = {
           description: item.description || "",
           ocrRawText: item.ocrRaw || "",
@@ -214,7 +219,6 @@ export async function renderAdmin(root) {
         };
         const metaEnc = await aesGcmEncrypt(key, jsonToBytes(meta));
 
-        // Upload encrypted bytes to Storage
         const photoId = crypto.randomUUID();
         const basePath = `albums/${APP.albumId}/${photoId}`;
         const thumbPath = `${basePath}/thumb.bin`;
@@ -223,7 +227,6 @@ export async function renderAdmin(root) {
         await st.uploadBytes(st.ref(storage, thumbPath), new Blob([thumbEnc.cipherBytes]));
         await st.uploadBytes(st.ref(storage, fullPath), new Blob([fullEnc.cipherBytes]));
 
-        // Write Firestore doc (includes adminTokenHash for rules)
         await fs.addDoc(fs.collection(db, "albums", APP.albumId, "photos"), {
           adminTokenHash,
           createdAt: fs.serverTimestamp(),
@@ -244,7 +247,7 @@ export async function renderAdmin(root) {
       }
     };
 
-    const row = el("div", { class: "card" }, [
+    return el("div", { class: "card" }, [
       el("div", { class: "row" }, [name, el("div", { class: "spacer" }), uploadBtn]),
       small,
       el("div", { class: "row" }, [
@@ -253,7 +256,140 @@ export async function renderAdmin(root) {
       ]),
       lineStatus
     ]);
+  }
 
-    return row;
+  function refreshManage(restartListener = false) {
+    if (!key) {
+      manageHelp.textContent = "Unlock first to view/edit photos.";
+      manageList.innerHTML = "";
+      return;
+    }
+
+    manageHelp.textContent = "Loading…";
+
+    if (unsubManage && (restartListener || true)) {
+      unsubManage();
+      unsubManage = null;
+    }
+
+    const q = fs.query(
+      fs.collection(db, "albums", APP.albumId, "photos"),
+      fs.orderBy("createdAt", "desc")
+    );
+
+    unsubManage = fs.onSnapshot(q, async (snap) => {
+      manageList.innerHTML = "";
+      manageHelp.textContent = `${snap.size} photo(s).`;
+
+      for (const d of snap.docs) {
+        const p = { id: d.id, ...d.data() };
+        manageList.append(await renderManageRow(p));
+      }
+    });
+  }
+
+  async function renderManageRow(p) {
+    const rowStatus = el("div", { class: "help", text: "" });
+
+    // decrypt meta
+    let meta = { description: "", ocrRawText: "", originalFilename: "" };
+    try {
+      const metaIv = fromB64(p.metaEnc.ivB64);
+      const metaCipher = fromB64(p.metaEnc.cipherB64);
+      const metaBytes = await aesGcmDecrypt(key, metaIv, metaCipher);
+      meta = bytesToJson(metaBytes);
+    } catch (e) {
+      rowStatus.textContent = "Could not decrypt metadata (wrong passphrase?).";
+    }
+
+    // load thumb preview
+    let thumbUrl = "";
+    try {
+      const encThumb = await st.getBytes(st.ref(storage, p.thumb.path));
+      const iv = fromB64(p.thumb.ivB64);
+      const decThumb = await aesGcmDecrypt(key, iv, new Uint8Array(encThumb));
+      thumbUrl = bytesToObjectUrl(decThumb, "image/jpeg");
+    } catch {}
+
+    const img = el("img", { src: thumbUrl, style: "width:120px;height:120px;object-fit:cover;border-radius:12px;border:1px solid rgba(0,0,0,.1);" });
+
+    const dateInput = el("input", { class: "input", placeholder: "YYYY-MM-DD", value: p.dateISO || "" });
+    const descInput = el("input", { class: "input", placeholder: "Description", value: meta.description || "" });
+
+    const saveBtn = el("button", { class: "btn", text: "Save" });
+    const delBtn = el("button", { class: "btn secondary", text: "Delete" });
+
+    saveBtn.onclick = async () => {
+      const dateISO = dateInput.value.trim();
+      if (dateISO && !isValidISODate(dateISO)) {
+        rowStatus.textContent = "Date must be YYYY-MM-DD (or leave blank).";
+        return;
+      }
+
+      rowStatus.textContent = "Saving…";
+      saveBtn.disabled = true;
+
+      try {
+        const newMeta = {
+          ...meta,
+          description: descInput.value || ""
+        };
+        const metaEnc = await aesGcmEncrypt(key, jsonToBytes(newMeta));
+
+        const docRef = fs.doc(db, "albums", APP.albumId, "photos", p.id);
+        await fs.updateDoc(docRef, {
+          adminTokenHash,
+          dateISO: dateISO || "",
+          metaEnc: { ivB64: toB64(metaEnc.ivBytes), cipherB64: toB64(metaEnc.cipherBytes) }
+        });
+
+        rowStatus.textContent = "Saved.";
+      } catch (e) {
+        console.error(e);
+        rowStatus.textContent = "Save failed (see console).";
+      } finally {
+        saveBtn.disabled = false;
+      }
+    };
+
+    delBtn.onclick = async () => {
+      if (!confirm("Delete this photo permanently?")) return;
+
+      rowStatus.textContent = "Deleting…";
+      delBtn.disabled = true;
+      saveBtn.disabled = true;
+
+      try {
+        // delete blobs first
+        await st.deleteObject(st.ref(storage, p.thumb.path));
+        await st.deleteObject(st.ref(storage, p.full.path));
+
+        // delete firestore doc
+        const docRef = fs.doc(db, "albums", APP.albumId, "photos", p.id);
+        await fs.deleteDoc(docRef);
+
+        rowStatus.textContent = "Deleted.";
+      } catch (e) {
+        console.error(e);
+        rowStatus.textContent = "Delete failed (see console).";
+        delBtn.disabled = false;
+        saveBtn.disabled = false;
+      }
+    };
+
+    return el("div", { class: "card" }, [
+      el("div", { class: "row" }, [
+        img,
+        el("div", { style: "flex:1; min-width:240px;" }, [
+          el("div", { class: "help", text: meta.originalFilename ? `File: ${meta.originalFilename}` : `Doc: ${p.id}` }),
+          el("div", { class: "row" }, [
+            el("div", { style: "flex:1; min-width: 160px;" }, [dateInput]),
+            el("div", { style: "flex:2; min-width: 220px;" }, [descInput]),
+          ]),
+          el("div", { class: "row" }, [saveBtn, delBtn]),
+          rowStatus
+        ])
+      ])
+    ]);
   }
 }

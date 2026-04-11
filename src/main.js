@@ -4,6 +4,7 @@ import { renderViewer } from "./viewer.js";
 import { renderAdmin } from "./admin.js";
 
 const app = document.getElementById("app");
+const OCR_DEBUG = true;
 
 function header() {
   return el("div", { class: "header" }, [

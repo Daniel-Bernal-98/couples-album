@@ -6,7 +6,7 @@ import {
   jsonToBytes, bytesToJson, fromB64
 } from "./crypto.js";
 import { fileToImageBitmap, resizeToJpegBytes, bytesToObjectUrl } from "./images.js";
-import { detectPrintedDateText, parsePrintedDateToISO } from "./ocr.js";
+import { detectPrintedDateText, detectPrintedDateTextFromBlob, parsePrintedDateToISO } from "./ocr.js";
 
 function getAdminTokenFromUrl() {
   const h = location.hash || "";
@@ -318,6 +318,33 @@ export async function renderAdmin(root) {
 
     const saveBtn = el("button", { class: "btn", text: "Save" });
     const delBtn = el("button", { class: "btn secondary", text: "Delete" });
+    const autoDateBtn = el("button", { class: "btn secondary", text: "Auto date" });
+
+    autoDateBtn.onclick = async () => {
+      rowStatus.textContent = "Detecting date…";
+      autoDateBtn.disabled = true;
+      try {
+        const encBytes = await st.getBytes(st.ref(storage, p.full.path));
+        const iv = fromB64(p.full.ivB64);
+        const decBytes = await aesGcmDecrypt(key, iv, new Uint8Array(encBytes));
+        const blob = new Blob([decBytes], { type: "image/jpeg" });
+        const { text } = await detectPrintedDateTextFromBlob(blob);
+        const iso = parsePrintedDateToISO(text);
+        if (!iso) {
+          rowStatus.textContent = `Could not detect date${text ? ` (OCR: "${text}")` : ""}. Please enter the date manually.`;
+          return;
+        }
+        const docRef = fs.doc(db, "albums", APP.albumId, "photos", p.id);
+        await fs.updateDoc(docRef, { dateISO: iso });
+        dateInput.value = iso;
+        rowStatus.textContent = `Date detected: ${iso}`;
+      } catch (e) {
+        console.error(e);
+        rowStatus.textContent = "Auto date failed. Please enter the date manually.";
+      } finally {
+        autoDateBtn.disabled = false;
+      }
+    };
 
     saveBtn.onclick = async () => {
       const dateISO = dateInput.value.trim();
@@ -386,7 +413,7 @@ export async function renderAdmin(root) {
             el("div", { style: "flex:1; min-width: 160px;" }, [dateInput]),
             el("div", { style: "flex:2; min-width: 220px;" }, [descInput]),
           ]),
-          el("div", { class: "row" }, [saveBtn, delBtn]),
+          el("div", { class: "row" }, [saveBtn, autoDateBtn, delBtn]),
           rowStatus
         ])
       ])

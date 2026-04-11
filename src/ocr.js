@@ -6,6 +6,7 @@ async function ensureTesseract() {
 }
 
 // OCR the bottom strip of the photo where the printed date usually is.
+// Accepts a File or Blob (e.g. from decrypted image bytes).
 export async function detectPrintedDateText(file) {
   const bmp = await createImageBitmap(file);
 
@@ -29,6 +30,12 @@ export async function detectPrintedDateText(file) {
   const text = (result?.data?.text || "").trim();
 
   return { text };
+}
+
+// OCR the bottom strip of an image given as raw bytes (e.g. decrypted from storage).
+// Creates a temporary Blob and delegates to detectPrintedDateText.
+export async function detectPrintedDateTextFromBlob(blob) {
+  return detectPrintedDateText(blob);
 }
 
 // Parse printed date formats like:

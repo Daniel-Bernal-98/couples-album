@@ -2,7 +2,7 @@
 const OCR_DEBUG = true;
 
 // Luminance threshold for binarisation: pixels darker than this become black (digits), rest white.
-const BINARY_THRESHOLD = 160;
+const BINARY_THRESHOLD = 210;
 
 // Tesseract character whitelist for date stamp OCR (digits and common separators only).
 const DATE_CHAR_WHITELIST = "0123456789/.- ";
@@ -39,7 +39,7 @@ export async function detectPrintedDateText(file) {
 
   // Focus on bottom-right corner where camera date stamps typically appear.
   // Use safe bounds to avoid zero-sized crop.
-  const sx = Math.max(0, Math.floor(bmp.width * 0.55));
+  const sx = Math.max(0, Math.floor(bmp.width * 0.45));
   const sy = Math.max(0, Math.floor(bmp.height * 0.70));
   const sw = Math.max(1, bmp.width - sx);
   const sh = Math.max(1, bmp.height - sy);

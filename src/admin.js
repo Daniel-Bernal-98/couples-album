@@ -157,7 +157,7 @@ export async function renderAdmin(root) {
       try {
         const r = await detectPrintedDateText(f);
         item.ocrRaw = r.text || "";
-        item.dateISO = parsePrintedDateToISO(item.ocrRaw) || "";
+        item.dateISO = r.bestISO || parsePrintedDateToISO(item.ocrRaw) || "";
       } catch {}
 
       queue.push(item);
@@ -328,8 +328,8 @@ export async function renderAdmin(root) {
         const iv = fromB64(p.full.ivB64);
         const decBytes = await aesGcmDecrypt(key, iv, new Uint8Array(encBytes));
         const blob = new Blob([decBytes], { type: "image/jpeg" });
-        const { text } = await detectPrintedDateTextFromBlob(blob);
-        const iso = parsePrintedDateToISO(text);
+        const { text, bestISO } = await detectPrintedDateTextFromBlob(blob);
+        const iso = bestISO || parsePrintedDateToISO(text);
         if (!iso) {
           rowStatus.textContent = `Could not detect date${text ? ` (OCR: "${text}")` : ""}. Please enter the date manually.`;
           return;

@@ -1,5 +1,5 @@
 // Set to true to enable verbose OCR debug logging in the browser console.
-const OCR_DEBUG = false;
+const OCR_DEBUG = true;
 
 // Baseline luminance threshold for binarisation: pixels darker than this become black (digits), rest white.
 const BINARY_THRESHOLD = 160;

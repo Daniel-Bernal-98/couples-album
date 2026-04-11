@@ -223,9 +223,6 @@ export async function detectPrintedDateTextFromBlob(blob) {
 export function parsePrintedDateToISO(text) {
   if (!text) return "";
 
-  // Normalize OCR output aggressively but safely
-  // - keep digits and separators/spaces
-  // - normalize common OCR confusions: O->0, I/L/|->1
   const t = String(text)
     .toUpperCase()
     .replace(/\s+/g, " ")
@@ -235,29 +232,44 @@ export function parsePrintedDateToISO(text) {
     .replace(/\s+/g, " ")
     .trim();
 
-  // Find ALL candidate triples like "DD MM YYYY" / "DD/MM/YYYY" / etc.
   const re = /\b(\d{1,2})[ \/\-.](\d{1,2})[ \/\-.](\d{4})\b/g;
 
-  let best = "";
+  let best = null;
 
   for (const m of t.matchAll(re)) {
-    let dd = m[1];
-    let mm = m[2];
-    const yyyy = m[3];
+    const ddRaw = m[1];
+    const mmRaw = m[2];
+    const yyyyRaw = m[3];
 
-    // Targeted month fixes for orange-stamp OCR:
-    // - "84" is commonly "04" (8 misread for 0)
-    // - more generally replace 8->0 inside month, then validate 1..12.
-    mm = mm.replace(/8/g, "0");
+    const ddN = Number(ddRaw);
+    if (!(ddN >= 1 && ddN <= 31)) continue;
 
-    const ddN = Number(dd);
-    const mmN = Number(mm);
-    const yyyyN = Number(yyyy);
+    // --- Fix month (only if invalid) ---
+    let mmFixed = mmRaw;
+    let mmN = Number(mmFixed);
+    if (!(mmN >= 1 && mmN <= 12)) {
+      mmFixed = mmFixed.replace(/8/g, "0"); // "84" -> "04"
+      mmN = Number(mmFixed);
+    }
+    if (!(mmN >= 1 && mmN <= 12)) continue;
 
-    if (yyyyN < 1970 || yyyyN > 2100) continue;
-    if (mmN < 1 || mmN > 12) continue;
-    if (ddN < 1 || ddN > 31) continue;
+    // --- Fix year (only if invalid) ---
+    let yyyyFixed = yyyyRaw;
+    let yyyyN = Number(yyyyFixed);
 
+    if (!(yyyyN >= 1970 && yyyyN <= 2100)) {
+      // Conservative OCR corrections seen with orange masking:
+      // - 8 often appears instead of 0
+      // - 3 sometimes appears instead of 5
+      yyyyFixed = yyyyFixed
+        .replace(/8/g, "0")
+        .replace(/3/g, "5");
+      yyyyN = Number(yyyyFixed);
+    }
+
+    if (!(yyyyN >= 1970 && yyyyN <= 2100)) continue;
+
+    // Calendar validation
     const d = new Date(Date.UTC(yyyyN, mmN - 1, ddN));
     if (
       d.getUTCFullYear() !== yyyyN ||
@@ -265,23 +277,16 @@ export function parsePrintedDateToISO(text) {
       d.getUTCDate() !== ddN
     ) continue;
 
-    // Prefer a candidate that had 2-digit day/month in the raw match
-    // (more likely a clean stamp read)
     const score =
-      (m[1].length === 2 ? 2 : 0) +
-      (m[2].length === 2 ? 1 : 0);
+      (ddRaw.length === 2 ? 2 : 0) +
+      (mmRaw.length === 2 ? 1 : 0);
 
-    if (!best || score > best.score) {
-      best = {
-        score,
-        iso:
-          String(yyyyN).padStart(4, "0") +
-          "-" +
-          String(mmN).padStart(2, "0") +
-          "-" +
-          String(ddN).padStart(2, "0"),
-      };
-    }
+    const iso =
+      String(yyyyN).padStart(4, "0") + "-" +
+      String(mmN).padStart(2, "0") + "-" +
+      String(ddN).padStart(2, "0");
+
+    if (!best || score > best.score) best = { score, iso };
   }
 
   return best ? best.iso : "";

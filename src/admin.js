@@ -1,5 +1,5 @@
 import { APP } from "./config.js";
-import { db, storage, fs, st } from "./firebase.js";
+import { db, storage, fs, st, ensureAnonAuth } from "./firebase.js";
 import { el, clear } from "./ui.js";
 import {
   sha256Hex, toB64, aesGcmEncrypt, aesGcmDecrypt, deriveKeyFromPassphrase,
@@ -7,9 +7,6 @@ import {
 } from "./crypto.js";
 import { fileToImageBitmap, resizeToJpegBytes, bytesToObjectUrl } from "./images.js";
 import { detectPrintedDateText, detectPrintedDateTextFromBlob, parsePrintedDateToISO } from "./ocr.js";
-
-// NEW: anonymous auth for admin uploads
-import { getAuth, signInAnonymously } from "firebase/auth";
 
 function getAdminTokenFromUrl() {
   const h = location.hash || "";
@@ -77,7 +74,7 @@ export async function renderAdmin(root) {
   queueWrap.append(el("div", { class: "help", text: "Tip: OCR date is best-effort—edit it if needed before uploading." }));
   queueWrap.append(queueList);
 
-  // NEW: manage section
+  // manage section
   const manageWrap = el("div", { class: "card" });
   const manageHeader = el("div", { class: "row" }, [
     el("div", { text: "Manage uploaded photos" }),
@@ -100,10 +97,6 @@ export async function renderAdmin(root) {
   let uploading = false;
   let unsubManage = null;
 
-  // NEW: auth instance + sign-in state for admin operations
-  let auth = null;
-  let signedIn = false;
-
   const queue = [];
 
   function setUploading(v) {
@@ -119,21 +112,12 @@ export async function renderAdmin(root) {
     status.textContent = "";
   }
 
-  async function ensureAnonAuth() {
-    // Only required for admin operations that touch Storage writes/deletes (and optionally Firestore writes).
-    if (signedIn) return;
-
-    auth = auth || getAuth();
-    await signInAnonymously(auth);
-    signedIn = true;
-  }
-
   initBtn.onclick = async () => {
     status.textContent = "Initializing…";
     setUploading(true);
 
     try {
-      // NEW: sign in anonymously so Storage rules can require request.auth != null
+      // IMPORTANT: sign in anonymously so Storage rules can require request.auth != null for writes
       await ensureAnonAuth();
 
       album = await getOrInitAlbumDoc(adminTokenHash);
@@ -223,7 +207,7 @@ export async function renderAdmin(root) {
       lineStatus.textContent = "Uploading…";
 
       try {
-        // NEW: ensure authenticated before any Storage write
+        // IMPORTANT: ensure authenticated before any Storage write
         await ensureAnonAuth();
 
         const bmp = await fileToImageBitmap(item.file);
@@ -409,7 +393,7 @@ export async function renderAdmin(root) {
       saveBtn.disabled = true;
 
       try {
-        // NEW: ensure authenticated before any Storage delete (write)
+        // IMPORTANT: ensure authenticated before any Storage delete (write)
         await ensureAnonAuth();
 
         // delete blobs first

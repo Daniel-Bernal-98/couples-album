@@ -223,35 +223,67 @@ export async function detectPrintedDateTextFromBlob(blob) {
 export function parsePrintedDateToISO(text) {
   if (!text) return "";
 
+  // Normalize OCR output aggressively but safely
+  // - keep digits and separators/spaces
+  // - normalize common OCR confusions: O->0, I/L/|->1
   const t = String(text)
     .toUpperCase()
     .replace(/\s+/g, " ")
-    .replace(/[O]/g, "0")           // O -> 0
-    .replace(/[IL|]/g, "1")         // I/L/| -> 1
-    .replace(/[^0-9\/.\- ]/g, "")   // strip any remaining non-date chars
+    .replace(/[O]/g, "0")
+    .replace(/[IL|]/g, "1")
+    .replace(/[^0-9\/.\- ]/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 
-  const m = t.match(/\b(\d{1,2})[ \/\-.](\d{1,2})[ \/\-.](\d{4})\b/);
-  if (!m) return "";
+  // Find ALL candidate triples like "DD MM YYYY" / "DD/MM/YYYY" / etc.
+  const re = /\b(\d{1,2})[ \/\-.](\d{1,2})[ \/\-.](\d{4})\b/g;
 
-  const dd = Number(m[1]);
-  const mm = Number(m[2]);
-  const yyyy = Number(m[3]);
+  let best = "";
 
-  if (yyyy < 1970 || yyyy > 2100) return "";
-  if (mm < 1 || mm > 12) return "";
-  if (dd < 1 || dd > 31) return "";
+  for (const m of t.matchAll(re)) {
+    let dd = m[1];
+    let mm = m[2];
+    const yyyy = m[3];
 
-  const d = new Date(Date.UTC(yyyy, mm - 1, dd));
-  if (
-    d.getUTCFullYear() !== yyyy ||
-    d.getUTCMonth() !== mm - 1 ||
-    d.getUTCDate() !== dd
-  ) return "";
+    // Targeted month fixes for orange-stamp OCR:
+    // - "84" is commonly "04" (8 misread for 0)
+    // - more generally replace 8->0 inside month, then validate 1..12.
+    mm = mm.replace(/8/g, "0");
 
-  return (
-    String(yyyy).padStart(4, "0") + "-" +
-    String(mm).padStart(2, "0") + "-" +
-    String(dd).padStart(2, "0")
-  );
+    const ddN = Number(dd);
+    const mmN = Number(mm);
+    const yyyyN = Number(yyyy);
+
+    if (yyyyN < 1970 || yyyyN > 2100) continue;
+    if (mmN < 1 || mmN > 12) continue;
+    if (ddN < 1 || ddN > 31) continue;
+
+    const d = new Date(Date.UTC(yyyyN, mmN - 1, ddN));
+    if (
+      d.getUTCFullYear() !== yyyyN ||
+      d.getUTCMonth() !== mmN - 1 ||
+      d.getUTCDate() !== ddN
+    ) continue;
+
+    // Prefer a candidate that had 2-digit day/month in the raw match
+    // (more likely a clean stamp read)
+    const score =
+      (m[1].length === 2 ? 2 : 0) +
+      (m[2].length === 2 ? 1 : 0);
+
+    if (!best || score > best.score) {
+      best = {
+        score,
+        iso:
+          String(yyyyN).padStart(4, "0") +
+          "-" +
+          String(mmN).padStart(2, "0") +
+          "-" +
+          String(ddN).padStart(2, "0"),
+      };
+    }
+  }
+
+  return best ? best.iso : "";
+}
 }

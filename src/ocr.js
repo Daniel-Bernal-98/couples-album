@@ -1,3 +1,12 @@
+// Set to true to enable verbose OCR debug logging in the browser console.
+const OCR_DEBUG = false;
+
+// Luminance threshold for binarisation: pixels darker than this become black (digits), rest white.
+const BINARY_THRESHOLD = 160;
+
+// Tesseract character whitelist for date stamp OCR (digits and common separators only).
+const DATE_CHAR_WHITELIST = "0123456789/.- ";
+
 // Loads Tesseract from CDN at runtime only when admin uploads.
 async function ensureTesseract() {
   if (window.Tesseract) return window.Tesseract;
@@ -5,17 +14,35 @@ async function ensureTesseract() {
   return window.Tesseract;
 }
 
-// OCR the bottom strip of the photo where the printed date usually is.
+// Apply grayscale + binary threshold to a canvas context to improve OCR accuracy
+// for orange/colored digits printed on a light background.
+function applyContrastThreshold(ctx, w, h) {
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    // Convert to grayscale (luminance)
+    const gray = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+    // Binary threshold: pixels darker than BINARY_THRESHOLD become black (digits), rest white
+    const val = gray < BINARY_THRESHOLD ? 0 : 255;
+    data[i] = val;
+    data[i + 1] = val;
+    data[i + 2] = val;
+    // alpha unchanged
+  }
+  ctx.putImageData(imageData, 0, 0);
+}
+
+// OCR the bottom-right area of the photo where the printed date stamp usually is.
 // Accepts a File or Blob (e.g. from decrypted image bytes).
 export async function detectPrintedDateText(file) {
   const bmp = await createImageBitmap(file);
 
-  // Printed date often near bottom. Crop bottom ~22%.
-  const cropH = Math.floor(bmp.height * 0.22);
-  const sx = 0;
-  const sy = bmp.height - cropH;
-  const sw = bmp.width;
-  const sh = cropH;
+  // Focus on bottom-right corner where camera date stamps typically appear.
+  // Use safe bounds to avoid zero-sized crop.
+  const sx = Math.max(0, Math.floor(bmp.width * 0.55));
+  const sy = Math.max(0, Math.floor(bmp.height * 0.70));
+  const sw = Math.max(1, bmp.width - sx);
+  const sh = Math.max(1, bmp.height - sy);
 
   const canvas = document.createElement("canvas");
   canvas.width = sw;
@@ -23,16 +50,27 @@ export async function detectPrintedDateText(file) {
   const ctx = canvas.getContext("2d");
   ctx.drawImage(bmp, sx, sy, sw, sh, 0, 0, sw, sh);
 
+  // Preprocess: grayscale + threshold to make digits stand out
+  applyContrastThreshold(ctx, sw, sh);
+
   const dataUrl = canvas.toDataURL("image/png");
 
   const Tesseract = await ensureTesseract();
-  const result = await Tesseract.recognize(dataUrl, "eng");
+  const result = await Tesseract.recognize(dataUrl, "eng", {
+    tessedit_char_whitelist: DATE_CHAR_WHITELIST,
+    tessedit_pageseg_mode: "7", // PSM 7: single text line
+  });
   const text = (result?.data?.text || "").trim();
+
+  if (OCR_DEBUG) {
+    console.debug("[OCR] crop:", { sx, sy, sw, sh });
+    console.debug("[OCR] raw text:", JSON.stringify(text));
+  }
 
   return { text };
 }
 
-// OCR the bottom strip of an image given as raw bytes (e.g. decrypted from storage).
+// OCR the bottom-right area of an image given as raw bytes (e.g. decrypted from storage).
 // Creates a temporary Blob and delegates to detectPrintedDateText.
 export async function detectPrintedDateTextFromBlob(blob) {
   return detectPrintedDateText(blob);
@@ -48,9 +86,9 @@ export function parsePrintedDateToISO(text) {
   const t = String(text)
     .toUpperCase()
     .replace(/\s+/g, " ")
-    .replace(/[O]/g, "0")      // O -> 0
-    .replace(/[IL|]/g, "1")    // I/L/| -> 1
-    .replace(/[^0-9\/.\- ]/g, "")
+    .replace(/[O]/g, "0")           // O -> 0
+    .replace(/[IL|]/g, "1")         // I/L/| -> 1
+    .replace(/[^0-9\/.\- ]/g, "")   // strip any remaining non-date chars
     .trim();
 
   const m = t.match(/\b(\d{1,2})[ \/\-.](\d{1,2})[ \/\-.](\d{4})\b/);

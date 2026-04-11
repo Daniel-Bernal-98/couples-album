@@ -286,4 +286,3 @@ export function parsePrintedDateToISO(text) {
 
   return best ? best.iso : "";
 }
-}

@@ -36,6 +36,37 @@ function applyContrastThreshold(ctx, w, h, threshold = BINARY_THRESHOLD, invert 
   ctx.putImageData(imageData, 0, 0);
 }
 
+// Convert likely orange stamp pixels to black and everything else to white.
+// This is more reliable than grayscale thresholding for orange digits on light backgrounds,
+// and tends to preserve thin strokes like the leading '1' in '10'.
+function applyOrangeInkMask(ctx, w, h) {
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+
+    // "Orange-ish" heuristic tuned for camera date stamps:
+    // strong red, moderate green, lower blue, with red dominance.
+    const isOrange =
+      r > 110 &&
+      g > 40 &&
+      b < 150 &&
+      (r - b) > 50 &&
+      (r - g) > 15;
+
+    const val = isOrange ? 0 : 255;
+    data[i] = val;
+    data[i + 1] = val;
+    data[i + 2] = val;
+    // alpha unchanged
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+}
+
 // Thicken thin strokes on an already-thresholded (black-on-white) canvas by drawing
 // it onto itself shifted 1 px to the right using the 'darken' composite operation.
 // 'darken' keeps the minimum (darker) value per channel, so black ink expands into
@@ -49,7 +80,10 @@ function boldenCanvas(canvas, ctx, w, h) {
   tCtx.drawImage(canvas, 0, 0);
 
   ctx.globalCompositeOperation = "darken";
-  ctx.drawImage(tmp, 1, 0); // draw shifted 1 px to the right → expands left edge of each glyph
+  // Expand strokes in a couple directions (more robust than only shifting right)
+  ctx.drawImage(tmp, 1, 0);
+  ctx.drawImage(tmp, -1, 0);
+  ctx.drawImage(tmp, 0, 1);
   ctx.globalCompositeOperation = "source-over";
 }
 
@@ -69,15 +103,8 @@ function averageLuminance(ctx, w, h) {
 //   2 – clean two-digit day AND valid ISO  (e.g. "10 04 2026" → 2026-04-10)
 //   1 – valid ISO but day was single-digit (e.g. "2 04 2026"  → 2026-04-02, less confident)
 //   0 – no valid date extracted
-// Using a score instead of first-match ensures a lower-threshold attempt that preserves
-// thin strokes (and therefore recovers the leading '1' in day '10') is preferred over an
-// earlier attempt that dropped it and returned a single-digit day.
 function scoreOCRResult(text, iso) {
   if (!iso) return 0;
-  // Check the raw OCR text (before parsePrintedDateToISO normalisation) for a clean
-  // two-digit day.  parsePrintedDateToISO accepts \d{1,2} for the day, so "2 04 2026"
-  // and "10 04 2026" both yield a valid ISO — but the first form means Tesseract lost
-  // the leading '1'.  Requiring \d{2} here distinguishes those two outcomes.
   const hasTwoDigitDay = /\b\d{2}[ \/\-.]\d{2}[ \/\-.]\d{4}\b/.test(text);
   return hasTwoDigitDay ? 2 : 1;
 }
@@ -97,45 +124,53 @@ function cropBitmap(bmp, sxFraction, syFraction) {
 }
 
 // OCR the bottom-right area of the photo where the printed date stamp usually is.
-// Runs up to 5 preprocessing/crop attempts and returns the result with the best score
-// (see scoreOCRResult).  Accepts a File or Blob (e.g. from decrypted image bytes).
+// Runs multiple preprocessing/crop attempts and returns the result with the best score.
+// Accepts a File or Blob (e.g. from decrypted image bytes).
 export async function detectPrintedDateText(file) {
   const bmp = await createImageBitmap(file);
   const Tesseract = await ensureTesseract();
 
-  // Attempt A: tight bottom-right crop, baseline threshold (least noise)
-  // Attempt B: same tight crop, lower threshold — preserves thin strokes like '1' in '10'
-  // Attempt C: same tight crop, even lower threshold + bolden pass — thickens thin strokes further
-  // Attempt D: slightly wider crop (catches stamps that start a bit further left)
-  // Attempt E: tight crop, adaptive threshold/invert based on background luminance
+  // Attempts:
+  // 1-3) tight crop with various thresholds (+bolden)
+  // 4) wider crop (this is often the only one that captures the full stamp)
+  // 5) adaptive threshold/invert
+  // 6) NEW: orange-ink mask on wider crop (+bolden) to preserve thin '1' in '10'
   const cropAttempts = [
-    { sxF: 0.55, syF: 0.70, threshold: 160, invert: false, bolden: false },
-    { sxF: 0.55, syF: 0.70, threshold: 140, invert: false, bolden: false },
-    { sxF: 0.55, syF: 0.70, threshold: 130, invert: false, bolden: true  },
-    { sxF: 0.50, syF: 0.70, threshold: 160, invert: false, bolden: false },
-    null, // computed dynamically based on luminance (see below)
+    { sxF: 0.55, syF: 0.70, threshold: 160, invert: false, bolden: false, orangeMask: false },
+    { sxF: 0.55, syF: 0.70, threshold: 140, invert: false, bolden: false, orangeMask: false },
+    { sxF: 0.55, syF: 0.70, threshold: 130, invert: false, bolden: true,  orangeMask: false },
+    { sxF: 0.50, syF: 0.70, threshold: 160, invert: false, bolden: false, orangeMask: false },
+
+    // placeholder for adaptive attempt (computed below)
+    null,
+
+    // NEW: orange mask attempt using the wider crop; bolden helps recover thin strokes.
+    { sxF: 0.50, syF: 0.70, threshold: 160, invert: false, bolden: true, orangeMask: true },
   ];
 
-  // For attempt E: sample luminance of the tight crop to decide preprocessing
+  // For adaptive attempt: sample luminance of the tight crop to decide preprocessing
   const { ctx: lCtx, sw: lSw, sh: lSh } = cropBitmap(bmp, 0.55, 0.70);
   const avgLum = averageLuminance(lCtx, lSw, lSh);
-  // Luminance > 200 means a very bright (near-white) background: a higher binarisation threshold
-  // (200) keeps orange/coloured digits dark without clipping subtle contrast differences.
-  // A darker background (avgLum ≤ 200) means digits may be lighter than the surroundings,
-  // so inverting the threshold (bright → black) is more reliable.
+
+  // Put adaptive attempt into the null slot (index 4)
   cropAttempts[4] = avgLum > 200
-    ? { sxF: 0.55, syF: 0.70, threshold: 200, invert: false, bolden: false }
-    : { sxF: 0.55, syF: 0.70, threshold: 160, invert: true,  bolden: false };
+    ? { sxF: 0.55, syF: 0.70, threshold: 200, invert: false, bolden: false, orangeMask: false }
+    : { sxF: 0.55, syF: 0.70, threshold: 160, invert: true,  bolden: false, orangeMask: false };
 
   let bestText = "";
   let bestISO = "";
   let bestScore = 0;
 
   for (let i = 0; i < cropAttempts.length; i++) {
-    const { sxF, syF, threshold, invert, bolden } = cropAttempts[i];
+    const { sxF, syF, threshold, invert, bolden, orangeMask } = cropAttempts[i];
     const { canvas, ctx, sx, sy, sw, sh } = cropBitmap(bmp, sxF, syF);
 
-    applyContrastThreshold(ctx, sw, sh, threshold, invert);
+    if (orangeMask) {
+      applyOrangeInkMask(ctx, sw, sh);
+    } else {
+      applyContrastThreshold(ctx, sw, sh, threshold, invert);
+    }
+
     if (bolden) {
       boldenCanvas(canvas, ctx, sw, sh);
     }
@@ -152,7 +187,7 @@ export async function detectPrintedDateText(file) {
     if (i === 0) bestText = text;
 
     if (OCR_DEBUG) {
-      console.debug(`[OCR] attempt ${i + 1}:`, { sx, sy, sw, sh, threshold, invert, bolden });
+      console.debug(`[OCR] attempt ${i + 1}:`, { sx, sy, sw, sh, threshold, invert, bolden, orangeMask });
       console.debug(`[OCR] attempt ${i + 1} raw text:`, JSON.stringify(text));
     }
 

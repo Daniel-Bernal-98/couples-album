@@ -8,6 +8,9 @@ import {
 import { fileToImageBitmap, resizeToJpegBytes, bytesToObjectUrl } from "./images.js";
 import { detectPrintedDateText, detectPrintedDateTextFromBlob, parsePrintedDateToISO } from "./ocr.js";
 
+// NEW: anonymous auth for admin uploads
+import { getAuth, signInAnonymously } from "firebase/auth";
+
 function getAdminTokenFromUrl() {
   const h = location.hash || "";
   const q = h.includes("?") ? h.split("?")[1] : "";
@@ -97,6 +100,10 @@ export async function renderAdmin(root) {
   let uploading = false;
   let unsubManage = null;
 
+  // NEW: auth instance + sign-in state for admin operations
+  let auth = null;
+  let signedIn = false;
+
   const queue = [];
 
   function setUploading(v) {
@@ -112,11 +119,23 @@ export async function renderAdmin(root) {
     status.textContent = "";
   }
 
+  async function ensureAnonAuth() {
+    // Only required for admin operations that touch Storage writes/deletes (and optionally Firestore writes).
+    if (signedIn) return;
+
+    auth = auth || getAuth();
+    await signInAnonymously(auth);
+    signedIn = true;
+  }
+
   initBtn.onclick = async () => {
     status.textContent = "Initializing…";
     setUploading(true);
 
     try {
+      // NEW: sign in anonymously so Storage rules can require request.auth != null
+      await ensureAnonAuth();
+
       album = await getOrInitAlbumDoc(adminTokenHash);
 
       const saltBytes = fromB64(album.kdf.saltB64);
@@ -204,6 +223,9 @@ export async function renderAdmin(root) {
       lineStatus.textContent = "Uploading…";
 
       try {
+        // NEW: ensure authenticated before any Storage write
+        await ensureAnonAuth();
+
         const bmp = await fileToImageBitmap(item.file);
 
         const thumb = await resizeToJpegBytes(bmp, 480, 0.75);
@@ -387,6 +409,9 @@ export async function renderAdmin(root) {
       saveBtn.disabled = true;
 
       try {
+        // NEW: ensure authenticated before any Storage delete (write)
+        await ensureAnonAuth();
+
         // delete blobs first
         await st.deleteObject(st.ref(storage, p.thumb.path));
         await st.deleteObject(st.ref(storage, p.full.path));
